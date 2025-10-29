@@ -1,6 +1,6 @@
 # LINUXCLEANER
 Scripts for automating clean up of your operating system (OS's based on any of top 3: Debian, Fedora, Arch)
-This script is written in bash (not zsh or anything else)
+This script is written in shell language
 
 
 ##  IMPORTANT: 
