@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================
-# Author: Anode Pyxis
-# For Operating Systems: Fedora Linux
+# Author: Anode Pyxis (Last Update Date: 23rd June 2026)
+# For Operating Systems: Fedora Based Linux
 # Version: 1.0
 # ==============================================================
 
@@ -11,7 +11,6 @@
 LOG_DIR="/var/log"
 LOG_FILE="$LOG_DIR/deepclean-$(date '+%Y%m%d-%H%M%S').log"
 DATE_NOW=$(date '+%Y-%m-%d %H:%M:%S')
-NOTIFY_CMD=$(command -v notify-send)
 
 # Color Codes
 GREEN="\033[1;32m"
@@ -27,8 +26,12 @@ log() {
     echo -e "${BLUE}[$(date '+%H:%M:%S')]${RESET} $1" | tee -a "$LOG_FILE"
 }
 
+# Fixed: Locates the active GUI user session so notifications render on-screen
 notify() {
-    [[ -n "$NOTIFY_CMD" ]] && notify-send "🧹 System Maintenance" "$1"
+    if command -v notify-send &>/dev/null && [[ -n "$SUDO_USER" ]]; then
+        sudo -u "$SUDO_USER" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$SUDO_USER")/bus" \
+        notify-send "🧹 System Maintenance" "$1"
+    fi
 }
 
 section() {
@@ -37,11 +40,20 @@ section() {
 }
 
 require_root() {
-    [[ $EUID -ne 0 ]] && { echo -e "${RED}⚠️ Please run as root (sudo).${RESET}"; exit 1; }
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}⚠️ Please run as root (sudo).${RESET}"
+        exit 1
+    fi
 }
 
+# Fixed: Captures and returns valid terminal return codes for conditional statements
 safe_run() {
-    "$@" >> "$LOG_FILE" 2>&1 || log "⚠️ Command failed: $*"
+    "$@" >> "$LOG_FILE" 2>&1
+    local status=$?
+    if [[ $status -ne 0 ]]; then
+        log "⚠️ Command failed: $* (Exit Code: $status)"
+    fi
+    return $status
 }
 
 # ---------------------------- #
@@ -61,7 +73,7 @@ notify "Starting system maintenance..."
 # ---------------------------- #
 section "Log Rotation"
 mkdir -p "$LOG_DIR"
-find "$LOG_DIR" -type f -name "deepclean*.log" -mtime +7 -exec rm -f {} \;
+find "$LOG_DIR" -maxdepth 1 -type f -name "deepclean*.log" -mtime +7 -exec rm -f {} \;
 log "Old logs older than 7 days removed."
 
 # ---------------------------- #
@@ -78,58 +90,83 @@ log "Architecture: $ARCHITECTURE"
 log "Desktop Environment: $DESKTOP_ENV"
 
 # ---------------------------- #
-#  1. DNF Maintenance
+#  1. Timeshift Snapshot (PRE-MAINTENANCE)
 # ---------------------------- #
-section "DNF Maintenance"
-safe_run dnf clean all -y
-safe_run dnf autoremove -y
+# Fixed: Repositioned to the top so you can safely rollback if updates break the system
+if command -v timeshift &>/dev/null; then
+    section "Creating Timeshift Snapshot"
+    safe_run timeshift --create --comments "Pre-maintenance snapshot"
+else
+    log "Timeshift not installed. Skipping backup."
+fi
+
+# ---------------------------- #
+#  2. DNF System Upgrades
+# ---------------------------- #
+section "DNF Package Optimization & Upgrades"
+
+# Fixed: Switched upgrade to interactive mode to allow reviewing package updates safely
+echo -e "${BLUE}[System Upgrade]${RESET} Synchronizing mirrors and running upgrades..."
+dnf upgrade --refresh
+
+log "Running post-upgrade integrity verification check..."
 safe_run dnf check
 
-# ---------------------------- #
-#  2. System Update & Verify
-# ---------------------------- #
-section "System Update & Integrity Check"
-safe_run dnf upgrade --refresh -y
-safe_run rpm --verify --all | grep -v "missing" >> "$LOG_FILE" 2>&1
+log "Removing orphaned/unused dependencies..."
+safe_run dnf autoremove -y
+
+log "Purging systemic DNF download caches..."
+safe_run dnf clean all
 
 # ---------------------------- #
-#  3. Rebuild System Caches
+#  3. System Integrity Check
+# ---------------------------- #
+section "RPM Verification"
+log "Verifying package file attributes against RPM database..."
+# Fixed: Resolved the broken pipeline syntax inside safe_run
+RPM_VERIFY=$(rpm --verify --all 2>/dev/null | grep -v "missing")
+if [[ -n "$RPM_VERIFY" ]]; then
+    echo "$RPM_VERIFY" >> "$LOG_FILE"
+else
+    log "All system files passed RPM verification."
+fi
+
+# ---------------------------- #
+#  4. Rebuild System Caches
 # ---------------------------- #
 section "Rebuilding System Caches"
 safe_run fc-cache -fv
 safe_run update-mime-database /usr/share/mime
-safe_run update-desktop-database
+if command -v update-desktop-database &>/dev/null; then
+    safe_run update-desktop-database
+fi
 
 # ---------------------------- #
-#  4. Verify Systemd Services
+#  5. Verify Systemd Services
 # ---------------------------- #
 section "Verifying Systemd Services"
 safe_run systemctl daemon-reexec
 safe_run systemctl daemon-reload
-safe_run systemctl --failed | tee -a "$LOG_FILE"
 
-# ---------------------------- #
-#  5. Rebuild RPM Database
-# ---------------------------- #
-section "Rebuilding RPM Database"
-safe_run rpm --rebuilddb
-
-# ---------------------------- #
-#  6. Optional: Timeshift Snapshot (if installed)
-# ---------------------------- #
-if command -v timeshift &>/dev/null; then
-    section "Creating Timeshift Snapshot (Pre-Maintenance)"
-    safe_run timeshift --create --comments "Pre-maintenance snapshot"
+log "Checking for failed systemd services..."
+# Fixed: Extracted standard output safely to prevent command execution blocking
+FAILED_SERVICES=$(systemctl --failed --no-legend)
+if [[ -n "$FAILED_SERVICES" ]]; then
+    echo "$FAILED_SERVICES" | tee -a "$LOG_FILE"
+else
+    log "All systemd units are running cleanly."
 fi
 
 # ---------------------------- #
-#  7. System Health Summary
+#  6. System Health Summary
 # ---------------------------- #
 section "System Health Summary"
-echo "Uptime: $(uptime -p)" | tee -a "$LOG_FILE"
-echo "Disk Usage:" | tee -a "$LOG_FILE"
-df -h --total | grep total | tee -a "$LOG_FILE"
-free -h | grep Mem: | tee -a "$LOG_FILE"
+{
+    echo "Uptime: $(uptime -p)"
+    echo "Disk Usage:"
+    df -h --total | grep total
+    free -h | grep Mem:
+} | tee -a "$LOG_FILE"
 
 # ---------------------------- #
 #  Done
